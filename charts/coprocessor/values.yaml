@@ -854,7 +854,7 @@ gwListener:
   #     --replay-skip-verify-proof
   #     --drift-no-consensus-timeout=5m
   #     --drift-post-consensus-grace=5m
-  #     --drift-auto-revert-enabled=false
+  #     --drift-auto-revert-enabled
   #       SAFETY: only enable with a majority quorum — >= 3 coprocessors and a
   #       strict-majority coprocessor threshold. Never enable with <= 2
   #       coprocessors. See docs/protocol/architecture/coprocessor.md.
