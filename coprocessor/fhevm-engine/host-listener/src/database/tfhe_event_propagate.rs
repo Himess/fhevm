@@ -2206,6 +2206,12 @@ impl Database {
                     "unhandled Acl::DecryptionSignaturesInvalidated event"
                 );
             }
+            AclContractEvents::AccountRetired(account_retired) => {
+                warn!(
+                    event = ?account_retired,
+                    "unhandled Acl::AccountRetired event"
+                );
+            }
         }
         self.tick.update();
         Ok(inserted)
@@ -3080,7 +3086,8 @@ pub fn acl_result_handles(event: &Log<AclContractEvents>) -> Vec<Handle> {
         | AclContractEvents::Unpaused(_)
         | AclContractEvents::BlockedAccount(_)
         | AclContractEvents::UnblockedAccount(_)
-        | AclContractEvents::DecryptionSignaturesInvalidated(_) => vec![],
+        | AclContractEvents::DecryptionSignaturesInvalidated(_)
+        | AclContractEvents::AccountRetired(_) => vec![],
     }
 }
 
