@@ -21,3 +21,6 @@ coverage.json
 package-lock.json
 pnpm-lock.yaml
 yarn.lock
+
+# test-only copy of OpenZeppelin confidential-contracts 0.5.3, ported mechanically to solc 0.8.24; kept close to upstream
+test/acl/retirement/oz-confidential-contracts-0.5.3
