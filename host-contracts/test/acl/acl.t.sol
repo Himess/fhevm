@@ -98,7 +98,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
      * It checks that the version is correct, the owner/pauser are set to the expected addresses, and the fhevmExecutor address is correct.
      */
     function test_PostProxyUpgradeCheck() public view {
-        assertEq(acl.getVersion(), string(abi.encodePacked("ACL v0.7.0")));
+        assertEq(acl.getVersion(), string(abi.encodePacked("ACL v0.8.0")));
         assertEq(acl.owner(), owner);
         assertEq(acl.isPauser(pauser), true);
         assertEq(acl.getFHEVMExecutorAddress(), fhevmExecutorAdd);
@@ -1071,7 +1071,10 @@ contract ACLTest is HostContractsDeployerTestUtils {
      */
     function test_OnlyOwnerCanAuthorizeUpgrade() public {
         /// @dev It does not revert since it called by the owner.
-        UnsafeUpgrades.upgradeProxy(proxy, address(new EmptyUUPSProxyACL()), "", owner);
+        /// @dev The target is a Core-declaring ACL implementation: since ACL v0.8.0 the upgrade guard refuses any
+        ///      implementation that drops retirement, including EmptyUUPSProxyACL
+        ///      (see ACLRetirementUpgradeMatrix.t.sol).
+        UnsafeUpgrades.upgradeProxy(proxy, address(new ACL()), "", owner);
     }
 
     ////////////////////////////////////////////////////////////////////////////

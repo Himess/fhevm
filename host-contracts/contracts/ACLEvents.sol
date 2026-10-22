@@ -56,4 +56,9 @@ contract ACLEvents {
     /// @notice Emitted when an account is removed from the deny list.
     /// @param account The address of the account that is unblocked.
     event UnblockedAccount(address indexed account);
+
+    /// @notice             Emitted when an account retires its decryption authority.
+    /// @param account      The retired account.
+    /// @param successor    The confirmed successor, or the null address when there is none.
+    event AccountRetired(address indexed account, address indexed successor);
 }

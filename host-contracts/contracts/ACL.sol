@@ -33,6 +33,12 @@ contract ACL is
     error AccountAlreadyBlocked(address account);
 
     /**
+     * @notice Returned if an account that is already retired calls `retireAccount()`.
+     * @param account The address of the account that is already retired.
+     */
+    error AccountAlreadyRetired(address account);
+
+    /**
      * @notice Returned if an account is not in the deny list.
      * @param account The address of the account that is not blocked.
      */
@@ -126,6 +132,20 @@ contract ACL is
     error SenderDenied(address sender);
 
     /**
+     * @notice Returned if a retired account calls a grant path: `allow`, `allowForDecryption`, `allowTransient`
+     *         (outside the FHEVMExecutor and ConfidentialBridge branch) or `delegateForUserDecryption`.
+     * @param sender The address of the retired account.
+     */
+    error SenderRetired(address sender);
+
+    /**
+     * @notice Returned if an upgrade targets an implementation that does not declare the Decryption Authority
+     *         Lifecycle Core interface through ERC-165, or that reports another retirement storage location.
+     * @param newImplementation The address of the rejected implementation.
+     */
+    error UpgradeDropsRetirement(address newImplementation);
+
+    /**
      * @notice Struct that represents a delegation.
      * @dev The `delegationCounter` is incremented at each delegation or revocation
      *      to allow off-chain clients to track changes.
@@ -151,6 +171,16 @@ contract ACL is
         mapping(address account => uint256 invalidatedBefore) decryptionSignatureInvalidatedBefore;
     }
 
+    /**
+     * @notice Retirement state, kept in its own ERC-7201 namespace so that it survives any release that keeps
+     *         the namespace (see `_authorizeUpgrade`).
+     * @dev Append-only: later lifecycle extensions add their fields here, in the same namespace.
+     */
+    /// @custom:storage-location erc7201:fhevm.storage.ACLRetirement
+    struct ACLRetirementStorage {
+        mapping(address account => bool isRetired) retired;
+    }
+
     /// @notice Name of the contract.
     string private constant CONTRACT_NAME = "ACL";
 
@@ -158,7 +188,7 @@ contract ACL is
     uint256 private constant MAJOR_VERSION = 0;
 
     /// @notice Minor version of the contract.
-    uint256 private constant MINOR_VERSION = 7;
+    uint256 private constant MINOR_VERSION = 8;
 
     /// @notice Patch version of the contract.
     uint256 private constant PATCH_VERSION = 0;
@@ -182,10 +212,24 @@ contract ACL is
 
     /// Constant used for making sure the version number used in the `reinitializer` modifier is
     /// identical between `initializeFromEmptyProxy` and the `reinitializeVX` method
-    uint64 private constant REINITIALIZER_VERSION = 8;
+    uint64 private constant REINITIALIZER_VERSION = 9;
 
     /// keccak256(abi.encode(uint256(keccak256("fhevm.storage.ACL")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant ACL_STORAGE_LOCATION = 0xa688f31953c2015baaf8c0a488ee1ee22eb0e05273cc1fd31ea4cbee42febc00;
+
+    /// keccak256(abi.encode(uint256(keccak256("fhevm.storage.ACLRetirement")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant ACL_RETIREMENT_STORAGE_LOCATION =
+        0xe6ae1005b480da47ced1ed3eb5869a54ca87c5d592369277249f4148c0e86200;
+
+    /// @notice ERC-165 interface id of ERC-165 itself, `supportsInterface(bytes4)`.
+    bytes4 private constant ERC165_INTERFACE_ID = 0x01ffc9a7;
+
+    /// @notice ERC-165 interface id of the Decryption Authority Lifecycle Core:
+    ///         `retireAccount()` (0xe7142996) XOR `isAccountRetired(address)` (0xb279091e).
+    bytes4 private constant DAL_CORE_INTERFACE_ID = 0x556d2088;
+
+    /// @notice Selector of `retirementStorageLocation()`, read from a new implementation by `_authorizeUpgrade`.
+    bytes4 private constant RETIREMENT_STORAGE_LOCATION_SELECTOR = 0xc89c7ccd;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -202,11 +246,11 @@ contract ACL is
     }
 
     /**
-     * @notice Re-initializes the contract from V6.
+     * @notice Re-initializes the contract from V7 (ACL v0.7.0). Retirement state needs no initialization.
      */
     /// @custom:oz-upgrades-unsafe-allow missing-initializer-call
     /// @custom:oz-upgrades-validate-as-initializer
-    function reinitializeV7() public virtual reinitializer(REINITIALIZER_VERSION) {}
+    function reinitializeV8() public virtual reinitializer(REINITIALIZER_VERSION) {}
 
     /**
      * @notice Accepts pending ownership and re-syncs the ConfidentialBridge's LayerZero
@@ -224,6 +268,8 @@ contract ACL is
     /**
      * @notice Allows the use of `handle` for the address `account`.
      * @dev The caller must not be in the deny list and must be allowed to use `handle` for allow() to succeed. If not, allow() reverts.
+     *      A retired caller is never allowed and reverts with `SenderRetired`. A grant to a retired `account` is
+     *      accepted and inert: no view ever answers true for a retired account.
      * @param handle Handle.
      * @param account Address of the account.
      */
@@ -232,6 +278,9 @@ contract ACL is
             revert SenderDenied(msg.sender);
         }
         if (!isAllowed(handle, msg.sender)) {
+            if (_retired().retired[msg.sender]) {
+                revert SenderRetired(msg.sender);
+            }
             revert SenderNotAllowed(msg.sender);
         }
         ACLStorage storage $ = _getACLStorage();
@@ -242,7 +291,7 @@ contract ACL is
     /**
      * @notice Allows a list of handles to be decrypted.
      * @dev The caller must not be in the deny list and must be allowed to use `handlesList[i]` for allowForDecryption() to succeed.
-     *      If not, allowForDecryption() reverts.
+     *      If not, allowForDecryption() reverts. A retired caller reverts with `SenderRetired`.
      * @param handlesList List of handles.
      */
     function allowForDecryption(bytes32[] memory handlesList) public virtual whenNotPaused {
@@ -259,6 +308,9 @@ contract ACL is
         for (uint256 k = 0; k < lenHandlesList; k++) {
             bytes32 handle = handlesList[k];
             if (!isAllowed(handle, msg.sender)) {
+                if (_retired().retired[msg.sender]) {
+                    revert SenderRetired(msg.sender);
+                }
                 revert SenderNotAllowed(msg.sender);
             }
             $.allowedForDecryption[handle] = true;
@@ -288,7 +340,7 @@ contract ACL is
      * @notice Allows the use of `handle` by address `account` for this transaction.
      * @dev The caller must not be in the deny list and must be allowed to use `handle` for allowTransient() to succeed.
      *      If not, allowTransient() reverts. The FHEVMExecutor and ConfidentialBridge contracts can always `allowTransient`,
-     *      contrarily to `allow`.
+     *      contrarily to `allow`. Any other retired caller reverts with `SenderRetired`.
      * @param handle Handle.
      * @param account Address of the account.
      */
@@ -299,6 +351,9 @@ contract ACL is
             }
 
             if (!isAllowed(handle, msg.sender)) {
+                if (_retired().retired[msg.sender]) {
+                    revert SenderRetired(msg.sender);
+                }
                 revert SenderNotAllowed(msg.sender);
             }
         }
@@ -317,6 +372,8 @@ contract ACL is
      * @notice Delegates an account the access to handles for user decryption, for instance, in the context of account
      * abstraction for issuing user decryption requests from a smart contract account.
      * @dev Cannot be called while the ACL is paused, including to extend or shorten an existing delegation.
+     *      A retired caller reverts with `SenderRetired`. Delegating to a retired delegate, or for a retired contract,
+     *      is accepted and inert: the delegated views answer false for every retired party.
      * @param delegate The address of the account that receives the delegation.
      * @param contractAddress The contract address to delegate access to, or `WILDCARD_DELEGATION_ADDRESS` for delegation across
      *        all contracts (until expiry). Mixing wildcard with per-contract delegations is allowed and can be useful,
@@ -328,6 +385,9 @@ contract ACL is
         address contractAddress,
         uint64 expirationDate
     ) public virtual whenNotPaused {
+        if (_retired().retired[msg.sender]) {
+            revert SenderRetired(msg.sender);
+        }
         ACLStorage storage $ = _getACLStorage();
         UserDecryptionDelegation storage userDecryptionDelegation = $.userDecryptionDelegations[msg.sender][delegate][
             contractAddress
@@ -415,6 +475,25 @@ contract ACL is
     }
 
     /**
+     * @notice Retires the caller's authority over its decryption rights (revocable access).
+     * @dev One-way: no function clears it. Not gated by pause or by the deny list, and callable by contracts.
+     *      Effective immediately: every authorization view answers false for the caller in every role (user,
+     *      delegator, delegate, contract), except operand checks made by the FHEVMExecutor, and every grant path
+     *      reverts for the caller. To keep access from a new account, batch the grants first:
+     *      `multicall([allow(h_i, newAccount)..., retireAccount()])`.
+     *      Limits: it is pre-emptive, not a clawback (whatever was already shared or decrypted stays exposed); it
+     *      restricts oracle access only (the account still acts on-chain); it is as final as this chain's governance.
+     */
+    function retireAccount() public virtual {
+        ACLRetirementStorage storage $ = _retired();
+        if ($.retired[msg.sender]) {
+            revert AccountAlreadyRetired(msg.sender);
+        }
+        $.retired[msg.sender] = true;
+        emit AccountRetired(msg.sender, address(0));
+    }
+
+    /**
      * @dev Triggers stopped state.
      * Only a pauser address can pause.
      * The contract must not be paused.
@@ -441,12 +520,17 @@ contract ACL is
      * @param delegate The address of the account that receives the delegation.
      * @param contractAddress The contract address to delegate access to.
      * @return expirationDate The UNIX timestamp when the user decryption delegation expires (0 means delegation is inactive).
+     *         Returns 0 if the delegator, the delegate or the contract is retired.
      */
     function getUserDecryptionDelegationExpirationDate(
         address delegator,
         address delegate,
         address contractAddress
     ) public view virtual returns (uint64) {
+        ACLRetirementStorage storage $r = _retired();
+        if ($r.retired[delegator] || $r.retired[delegate] || $r.retired[contractAddress]) {
+            return 0;
+        }
         ACLStorage storage $ = _getACLStorage();
         UserDecryptionDelegation storage userDecryptionDelegation = $.userDecryptionDelegations[delegator][delegate][
             contractAddress
@@ -510,12 +594,21 @@ contract ACL is
     /**
      * @notice Returns whether the account is allowed to use the `handle`, either due to
      * allowTransient() or allow().
+     * @dev Returns false for a retired `account` whenever the caller is not the FHEVMExecutor. The executor exemption
+     *      exists for exactly one evaluation: authorizing an operand's use as input to a computation the executor
+     *      performs for its caller, whose outputs it grants only transiently and only to that caller. Every grant,
+     *      publication, delegation, bridge transfer, deputy check and off-chain verifier reads this view with another
+     *      caller, so the exemption is never an export route. The executor path reads the raw persisted mapping and
+     *      never the retirement slot.
      * @param handle Handle.
      * @param account Address of the account.
      * @return isAllowed Whether the account can access the handle.
      */
     function isAllowed(bytes32 handle, address account) public view virtual returns (bool) {
-        return allowedTransient(handle, account) || persistAllowed(handle, account);
+        if (msg.sender != FHEVM_EXECUTOR_ADDRESS && _retired().retired[account]) {
+            return false;
+        }
+        return allowedTransient(handle, account) || _getACLStorage().persistedAllowedPairs[handle][account];
     }
 
     /**
@@ -530,6 +623,7 @@ contract ACL is
 
     /**
      * @notice Returns whether an account is delegated for user decryption on `contractAddress` or on all contracts.
+     * @dev Returns false if the delegator, the delegate or the contract is retired.
      * @param delegator The address of the account that delegates access to its handles.
      * @param delegate The address of the account that receives the delegation.
      * @param contractAddress The app contract to check the delegation for.
@@ -540,6 +634,10 @@ contract ACL is
         address delegate,
         address contractAddress
     ) external view virtual returns (bool) {
+        ACLRetirementStorage storage $r = _retired();
+        if ($r.retired[delegator] || $r.retired[delegate] || $r.retired[contractAddress]) {
+            return false;
+        }
         ACLStorage storage $ = _getACLStorage();
         return
             _isUserDecryptionDelegationActive($, delegator, delegate, WILDCARD_DELEGATION_ADDRESS) ||
@@ -551,7 +649,7 @@ contract ACL is
      * @dev Succeeds when the delegator and `contractAddress` are both persistently allowed on the handle, and either
      *      a non-expired delegation exists for `(delegator, delegate, contractAddress)` or for
      *      `(delegator, delegate, WILDCARD_DELEGATION_ADDRESS)`. Wildcard does not bypass `allow`; it only avoids per-contract
-     *      delegation entries.
+     *      delegation entries. Returns false if the delegator, the delegate or the contract is retired.
      * @param delegator The address of the account that delegates access to its handles.
      * @param delegate The address of the account that receives the delegation.
      * @param contractAddress The app contract associated with the handle for this check.
@@ -564,6 +662,10 @@ contract ACL is
         address contractAddress,
         bytes32 handle
     ) public view virtual returns (bool) {
+        ACLRetirementStorage storage $r = _retired();
+        if ($r.retired[delegator] || $r.retired[delegate] || $r.retired[contractAddress]) {
+            return false;
+        }
         ACLStorage storage $ = _getACLStorage();
         if (!$.persistedAllowedPairs[handle][delegator] || !$.persistedAllowedPairs[handle][contractAddress]) {
             return false;
@@ -575,13 +677,14 @@ contract ACL is
 
     /**
      * @notice Returns `true` if address `a` is allowed to use `c` and `false` otherwise.
+     * @dev Returns false for a retired `account`, whoever the caller is.
      * @param handle Handle.
      * @param account Address of the account.
      * @return isAllowed Whether the account can access the handle.
      */
     function persistAllowed(bytes32 handle, address account) public view virtual returns (bool) {
         ACLStorage storage $ = _getACLStorage();
-        return $.persistedAllowedPairs[handle][account];
+        return $.persistedAllowedPairs[handle][account] && !_retired().retired[account];
     }
 
     /**
@@ -592,6 +695,15 @@ contract ACL is
     function isAccountDenied(address account) public view virtual returns (bool) {
         ACLStorage storage $ = _getACLStorage();
         return $.denyList[account];
+    }
+
+    /**
+     * @notice Returns `true` if `account` has retired its decryption authority through `retireAccount()`.
+     * @param account Address of the account.
+     * @return isAccountRetired Whether the account is retired.
+     */
+    function isAccountRetired(address account) public view virtual returns (bool) {
+        return _retired().retired[account];
     }
 
     /**
@@ -669,9 +781,47 @@ contract ACL is
     }
 
     /**
-     * @dev Should revert when `msg.sender` is not authorized to upgrade the contract.
+     * @notice ERC-165 interface detection.
+     * @dev True for ERC-165 itself (0x01ffc9a7) and for the Decryption Authority Lifecycle Core (0x556d2088).
+     * @param interfaceId The interface identifier.
+     * @return supported Whether the interface is supported.
      */
-    function _authorizeUpgrade(address _newImplementation) internal virtual override onlyOwner {}
+    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {
+        return interfaceId == ERC165_INTERFACE_ID || interfaceId == DAL_CORE_INTERFACE_ID;
+    }
+
+    /**
+     * @notice Returns the ERC-7201 location of the retirement state, `erc7201:fhevm.storage.ACLRetirement`.
+     * @dev `_authorizeUpgrade` requires every new implementation to report this same location.
+     * @return location The storage location.
+     */
+    function retirementStorageLocation() public pure virtual returns (bytes32) {
+        return ACL_RETIREMENT_STORAGE_LOCATION;
+    }
+
+    /**
+     * @dev Should revert when `msg.sender` is not authorized to upgrade the contract.
+     *      Also reverts with `UpgradeDropsRetirement` unless the new implementation (a) reports ERC-165 support for
+     *      the Decryption Authority Lifecycle Core and (b) reports the same retirement storage location. Both checks
+     *      run in the current implementation, before the switch. They stop accidental downgrades and namespace drift,
+     *      not an implementation that lies about either answer.
+     */
+    function _authorizeUpgrade(address newImplementation) internal virtual override onlyOwner {
+        // The selector of supportsInterface(bytes4) equals the ERC-165 interface id, 0x01ffc9a7.
+        (bool okCore, bytes memory retCore) = newImplementation.staticcall(
+            abi.encodeWithSelector(ERC165_INTERFACE_ID, DAL_CORE_INTERFACE_ID)
+        );
+        (bool okLocation, bytes memory retLocation) = newImplementation.staticcall(
+            abi.encodeWithSelector(RETIREMENT_STORAGE_LOCATION_SELECTOR)
+        );
+        bool declaresCore = okCore && retCore.length == 32 && uint256(bytes32(retCore)) == 1;
+        bool sameState = okLocation &&
+            retLocation.length == 32 &&
+            bytes32(retLocation) == ACL_RETIREMENT_STORAGE_LOCATION;
+        if (!declaresCore || !sameState) {
+            revert UpgradeDropsRetirement(newImplementation);
+        }
+    }
 
     /// @dev Looks up `userDecryptionDelegations[delegator][delegate][contractAddress]`.
     /// @param contractAddress App contract from the decryption request, or `WILDCARD_DELEGATION_ADDRESS` for the wildcard row.
@@ -690,6 +840,15 @@ contract ACL is
     function _getACLStorage() internal pure returns (ACLStorage storage $) {
         assembly {
             $.slot := ACL_STORAGE_LOCATION
+        }
+    }
+
+    /**
+     * @dev Returns the ACL retirement storage location.
+     */
+    function _retired() internal pure returns (ACLRetirementStorage storage $) {
+        assembly {
+            $.slot := ACL_RETIREMENT_STORAGE_LOCATION
         }
     }
 }
