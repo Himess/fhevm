@@ -4,7 +4,7 @@ gateway:
   gatewayConfig: "0xDE537Be194777A56f8B19d14079E6a78249390ab"
   kmsGeneration: "0x290947F9fed2d91fdB22f35E162aDfA744b7aEe3"
 ethereum:
-  protocolConfig: "0x77627828a55156b04Ac0DC0eb30467f1a552BB03"
+  protocolConfig: "0xD8236B57394f90726b26aB25D38CeAC776E1a7C4"
 # Host chains deployed on this network. Every entry needs a URL in
 # commonConfig.hostChains.<name>.url.
 hostChains:
