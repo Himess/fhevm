@@ -108,8 +108,9 @@ fn try_ecrecover(digest: &B256, signature: &[u8]) -> Option<Address> {
 
 /// Gas-bounded static call to `IERC1271(addr).isValidSignature(digest, signature)`.
 ///
-/// Returns `Ok(())` iff returndata length ≥ 32 and the leading bytes4 equals the canonical
-/// magic value `0x1626ba7e`. Otherwise:
+/// Returns `Ok(())` iff returndata length ≥ 32 and its first 32-byte word is the canonical
+/// magic value `0x1626ba7e` followed by zero padding (the same check as OpenZeppelin's
+/// `SignatureChecker`). Otherwise:
 /// - empty returndata → `EmptySigOnEoa` / `EoaMismatchNoCode` (depending on whether the
 ///   original signature was empty). At the EVM level, `STATICCALL` to a no-code address
 ///   succeeds with empty returndata, so this is the dominant signal that `addr` is an EOA.
@@ -117,6 +118,7 @@ fn try_ecrecover(digest: &B256, signature: &[u8]) -> Option<Address> {
 ///   outcome, slightly inaccurate error message; not worth a second RPC to disambiguate.
 /// - returndata length 1..32 → `Rejected` (non-compliant ABI return);
 /// - leading bytes don't match magic → `WrongMagic`;
+/// - magic followed by non-zero padding → `Rejected` (non-compliant ABI return);
 /// - `isValidSignature` reverted with a reason → `Rejected`;
 /// - `isValidSignature` reverted with no reason → `EmptyRevert` (ambiguous, retryable);
 /// - any other RPC-layer error → `Transport`.
@@ -178,11 +180,22 @@ async fn check_erc1271_signature<P: Provider>(
     }
 
     let magic = FixedBytes::<4>::from_slice(&returndata[..4]);
-    if magic.0 == ERC1271_MAGIC_VALUE {
-        Ok(())
-    } else {
-        Err(Erc1271Error::WrongMagic(addr, magic))
+    if magic.0 != ERC1271_MAGIC_VALUE {
+        return Err(Erc1271Error::WrongMagic(addr, magic));
     }
+
+    // Compare the whole word, like `SignatureChecker` does with
+    // `abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector)`.
+    // Checking only the leading bytes4 would also accept returndata that just starts with the
+    // selector, e.g. a contract (or the identity precompile at 0x04) echoing the calldata.
+    if returndata[4..32].iter().any(|b| *b != 0) {
+        return Err(Erc1271Error::Rejected(
+            addr,
+            "returndata is not the magic value followed by zero padding".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Verify the EIP-712 signature on a user-decryption request per RFC-012.
@@ -426,6 +439,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Erc1271Error::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn erc1271_magic_with_non_zero_padding_rejects() {
+        // The leading bytes4 is the magic value but the rest of the word isn't zero padding,
+        // e.g. an address that echoes the calldata back (the identity precompile does this).
+        let asserter = Asserter::new();
+        let provider = mock_provider(asserter.clone());
+        let claimed = Address::from([0x04; 20]);
+        let digest = B256::from([0xAB; 32]);
+        let sig = vec![0x11_u8; 65];
+
+        let echoed = isValidSignatureCall {
+            hash: digest,
+            signature: Bytes::copy_from_slice(&sig),
+        }
+        .abi_encode();
+        asserter.push_success(&Bytes::from(echoed));
+
+        let err = verify_signature(&provider, claimed, digest, &sig, TEST_GAS)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Erc1271Error::Rejected(_, _)));
     }
 
     #[tokio::test]
