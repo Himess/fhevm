@@ -367,6 +367,20 @@ fn mul_div_factor1_width_bytes(
     }
 }
 
+// Byte width of the scalar rhs that the div/rem compute path keeps for a given lhs type
+// (to_be_u8_bit, to_be_u16_bit, ... keep the low bytes). Unknown types fall back to the
+// whole scalar, which is the old behaviour.
+fn scalar_rhs_width_bytes(lhs_type: Option<i16>, rhs_len: usize) -> usize {
+    match lhs_type {
+        Some(2) => 1,  // Uint8
+        Some(3) => 2,  // Uint16
+        Some(4) => 4,  // Uint32
+        Some(5) => 8,  // Uint64
+        Some(6) => 16, // Uint128
+        _ => rhs_len,
+    }
+}
+
 // return output ciphertext type
 pub fn check_fhe_operand_types(
     fhe_operation: i32,
@@ -435,10 +449,19 @@ pub fn check_fhe_operand_types(
                 });
             }
 
-            // special case for div operation, rhs for scalar must not be zero
-            if is_scalar && fhe_op == SupportedFheOperations::FheDiv {
-                let all_zeroes = input_handles[1].iter().all(|i| *i == 0u8);
-                if all_zeroes {
+            // special case for div and rem: the scalar rhs must not be zero. The compute
+            // path only keeps the low bytes that fit the lhs type (see to_be_u8_bit and
+            // friends), so check those bytes, like FheMulDiv does for its divisor.
+            if is_scalar
+                && matches!(
+                    fhe_op,
+                    SupportedFheOperations::FheDiv | SupportedFheOperations::FheRem
+                )
+            {
+                let rhs = &input_handles[1];
+                let width = scalar_rhs_width_bytes(get_ct_type(&input_handles[0]).ok(), rhs.len());
+                let rhs_low = &rhs[rhs.len().saturating_sub(width)..];
+                if rhs_low.iter().all(|b| *b == 0) {
                     return Err(FhevmError::FheOperationScalarDivisionByZero {
                         lhs_handle: format!("0x{}", hex::encode(&input_handles[0])),
                         rhs_value: format!("0x{}", hex::encode(&input_handles[1])),
@@ -617,7 +640,7 @@ pub fn check_fhe_operand_types(
                     }
 
                     let upper_bound = &input_handles[1];
-                    if upper_bound.is_empty() && upper_bound.iter().all(|i| *i == 0) {
+                    if upper_bound.is_empty() || upper_bound.iter().all(|i| *i == 0) {
                         return Err(FhevmError::RandOperationUpperBoundCannotBeZero {
                             fhe_operation,
                             fhe_operation_name: format!("{:?}", fhe_op),
@@ -3092,5 +3115,110 @@ mod fhe_mul_div_tests {
         let lhs = handle_with_type(2);
         let rhs = handle_with_type(2);
         assert!(check_fhe_operand_types(OP, &[lhs, rhs], &[false, false]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scalar_zero_check_tests {
+    use super::{check_fhe_operand_types, SupportedFheOperations};
+    use crate::types::FhevmError;
+
+    fn handle_with_type(type_byte: u8) -> Vec<u8> {
+        let mut h = vec![0u8; 32];
+        h[30] = type_byte;
+        h
+    }
+
+    // 32-byte big-endian scalar, the way host-listener encodes it
+    fn scalar(low_bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 32];
+        out[32 - low_bytes.len()..].copy_from_slice(low_bytes);
+        out
+    }
+
+    fn check(op: SupportedFheOperations, lhs_type: u8, rhs: Vec<u8>) -> Result<(), FhevmError> {
+        check_fhe_operand_types(
+            op as i32,
+            &[handle_with_type(lhs_type), rhs],
+            &[false, true],
+        )
+    }
+
+    fn is_div_by_zero(res: Result<(), FhevmError>) -> bool {
+        matches!(
+            res,
+            Err(FhevmError::FheOperationScalarDivisionByZero { .. })
+        )
+    }
+
+    const DIV_REM: [SupportedFheOperations; 2] = [
+        SupportedFheOperations::FheDiv,
+        SupportedFheOperations::FheRem,
+    ];
+
+    #[test]
+    fn div_and_rem_reject_zero_scalar() {
+        for op in DIV_REM {
+            for lhs_type in [2u8, 3, 4, 5, 6] {
+                assert!(
+                    is_div_by_zero(check(op, lhs_type, scalar(&[0]))),
+                    "{op:?} type {lhs_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn div_and_rem_reject_scalar_that_truncates_to_zero() {
+        // not zero as 32 bytes, but zero once truncated to the lhs width
+        for op in DIV_REM {
+            for (lhs_type, width) in [(2u8, 1usize), (3, 2), (4, 4), (5, 8), (6, 16)] {
+                let mut low = vec![0u8; width + 1];
+                low[0] = 1;
+                assert!(
+                    is_div_by_zero(check(op, lhs_type, scalar(&low))),
+                    "{op:?} type {lhs_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn div_and_rem_accept_non_zero_scalar() {
+        for op in DIV_REM {
+            for (lhs_type, width) in [(2u8, 1usize), (3, 2), (4, 4), (5, 8), (6, 16)] {
+                let mut low = vec![0u8; width];
+                low[0] = 1; // highest byte that still fits the type
+                assert!(
+                    check(op, lhs_type, scalar(&low)).is_ok(),
+                    "{op:?} type {lhs_type}"
+                );
+                assert!(
+                    check(op, lhs_type, scalar(&[7])).is_ok(),
+                    "{op:?} type {lhs_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rand_bounded_rejects_zero_upper_bound() {
+        let op = SupportedFheOperations::FheRandBounded as i32;
+        let seed = vec![0u8; 16];
+        let rand_type = vec![5u8];
+        let all_scalar = [true, true, true];
+        for upper_bound in [vec![0u8; 32], vec![]] {
+            let res = check_fhe_operand_types(
+                op,
+                &[seed.clone(), upper_bound, rand_type.clone()],
+                &all_scalar,
+            );
+            assert!(matches!(
+                res,
+                Err(FhevmError::RandOperationUpperBoundCannotBeZero { .. })
+            ));
+        }
+        let res = check_fhe_operand_types(op, &[seed, scalar(&[16]), rand_type], &all_scalar);
+        assert!(res.is_ok());
     }
 }
